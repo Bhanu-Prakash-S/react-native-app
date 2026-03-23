@@ -32,6 +32,13 @@
       "expo-router",
       "expo-font",
       "expo-secure-store",
+      "expo-video",
+      [
+        "expo-screen-orientation",
+        {
+          "initialOrientation": "PORTRAIT_UP"
+        }
+      ],
       [
         "expo-splash-screen",
         {

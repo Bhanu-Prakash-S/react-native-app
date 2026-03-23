@@ -1,192 +1,871 @@
-// // app/lesson/[id].tsx
+// // // // // app/lesson/[id].tsx
 
+import { LinearGradient } from "expo-linear-gradient";
 import { useLocalSearchParams, useRouter } from "expo-router";
+import * as ScreenOrientation from "expo-screen-orientation";
+import { VideoView, useVideoPlayer } from "expo-video";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
-    Dimensions,
-    StyleSheet,
-    Text,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  Dimensions,
+  PanResponder,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  TouchableWithoutFeedback,
+  View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+
 import {
-    Colors,
-    FontFamily,
-    FontSize,
-    Layout,
-    Radii,
-    Spacing
+  Colors,
+  FontFamily,
+  FontSize,
+  Layout,
+  Radii,
+  Shadows,
+  Spacing,
 } from "../../constants/theme";
+import { useAuthStore, useProgressStore } from "../../lib/store";
+import {
+  Lesson,
+  LessonWithContext,
+  getLessonWithContext,
+  getLessons,
+  upsertProgress,
+} from "../../lib/supabase";
+import { formatDuration } from "../../lib/utils";
 
-const { width: SCREEN_W } = Dimensions.get("window");
-const VIDEO_H = (SCREEN_W * 9) / 16;
-
-const LESSON_DATA: Record<
-  string,
-  { title: string; chapter: string; duration: string }
-> = {
-  l1: {
-    title: "Stone Age Civilizations",
-    chapter: "Prehistoric India",
-    duration: "18 min",
-  },
-  l2: {
-    title: "Chalcolithic Period",
-    chapter: "Prehistoric India",
-    duration: "14 min",
-  },
-  l3: {
-    title: "Megalithic Culture",
-    chapter: "Prehistoric India",
-    duration: "22 min",
-  },
-  l5: {
-    title: "Discovery & Excavation",
-    chapter: "Indus Valley",
-    duration: "16 min",
-  },
-  "1": {
-    title: "The Maurya Empire & Ashoka",
-    chapter: "Ancient History · Ch. 2",
-    duration: "24 min",
-  },
-};
+const SAVE_INTERVAL_MS = 10_000;
+const CONTROLS_HIDE_MS = 3_500;
 
 export default function LessonScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id: string }>();
+  const { user, profile } = useAuthStore();
+  const { setProgress } = useProgressStore();
 
-  const lesson = LESSON_DATA[id ?? "1"] ?? {
-    title: "Lesson Title",
-    chapter: "Chapter Name",
-    duration: "—",
+  // ── Lesson data ──────────────────────────────────────────────────────────
+  const [lesson, setLesson] = useState<LessonWithContext | null>(null);
+  const [chapterLessons, setChapterLessons] = useState<Lesson[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  // ── Player UI state ──────────────────────────────────────────────────────
+  const videoViewRef = useRef<VideoView>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  const [playerStatus, setPlayerStatus] = useState<string>("idle");
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [showControls, setShowControls] = useState(true);
+  const [currentSecs, setCurrentSecs] = useState(0);
+  const [durationSecs, setDurationSecs] = useState(0);
+
+  // Screen width for 16:9 box — updated on rotation
+  const [screenWidth, setScreenWidth] = useState(
+    Dimensions.get("window").width,
+  );
+  useEffect(() => {
+    const sub = Dimensions.addEventListener("change", ({ window }) => {
+      setScreenWidth(window.width);
+    });
+    return () => sub.remove();
+  }, []);
+  const videoH = (screenWidth * 9) / 16;
+
+  // ── Stable refs (safe to read inside PanResponder / intervals) ───────────
+  const currentSecsRef = useRef(0);
+  const durationSecsRef = useRef(0);
+  const lastSavedRef = useRef(0);
+  const saveTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lessonRef = useRef<LessonWithContext | null>(null);
+  // Guard: resume seek must fire ONCE only. Every seek triggers a new
+  // readyToPlay event (player re-buffers after seek), which would
+  // re-trigger the seek → infinite loop + play/pause flicker.
+  const hasResumed = useRef(false);
+
+  // ── Keep durationSecsRef in sync ─────────────────────────────────────────
+  useEffect(() => {
+    durationSecsRef.current = durationSecs;
+  }, [durationSecs]);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // KEY FIX #1:
+  // Always initialise useVideoPlayer with null so the player instance is
+  // STABLE for the entire lifetime of this screen.
+  // We call player.replace(source) once the lesson URL is ready.
+  // This prevents "shared object already released" because the PanResponder
+  // (frozen in useRef) always talks to the same player object.
+  // ─────────────────────────────────────────────────────────────────────────
+  const player = useVideoPlayer(null, (p) => {
+    p.timeUpdateEventInterval = 0.5;
+  });
+
+  // ── Load lesson then replace source ─────────────────────────────────────
+  useEffect(() => {
+    if (!id) return;
+    getLessonWithContext(id).then(async (data) => {
+      setLesson(data);
+      lessonRef.current = data;
+
+      if (data?.mux_playback_id) {
+        const url = `https://stream.mux.com/${data.mux_playback_id}.m3u8`;
+        // Reset resume guard so the new lesson seeks to its own saved position
+        hasResumed.current = false;
+        // replace() keeps the same player instance — no release/recreate
+
+        try {
+          await player.replaceAsync({ uri: url });
+        } catch (_) {}
+      }
+
+      if (data?.chapter_id) {
+        const lessons = await getLessons(data.chapter_id);
+        setChapterLessons(lessons);
+      }
+      setLoading(false);
+    });
+
+    return () => {
+      // Pause on unmount so audio doesn't ghost after navigation
+      try {
+        player.pause();
+      } catch (_) {}
+    };
+  }, [id]);
+
+  // ── Subscribe to player events ───────────────────────────────────────────
+  useEffect(() => {
+    const subs = [
+      player.addListener("playingChange", ({ isPlaying: p }) => {
+        setIsPlaying(p);
+      }),
+
+      player.addListener("mutedChange", ({ muted }) => {
+        setIsMuted(muted);
+      }),
+
+      player.addListener("statusChange", ({ status }) => {
+        setPlayerStatus(status);
+        if (status === "readyToPlay") {
+          const dur = player.duration;
+          setDurationSecs(dur);
+          durationSecsRef.current = dur;
+
+          // Resume seek — only ever runs ONCE per screen mount.
+          // Seeking triggers a new readyToPlay after buffering; without
+          // this guard that fires another seek → infinite loop.
+          if (!hasResumed.current) {
+            hasResumed.current = true;
+            const saved =
+              useProgressStore.getState().progressMap[
+                lessonRef.current?.id ?? ""
+              ];
+            if (saved?.watched_seconds > 5) {
+              setTimeout(() => {
+                try {
+                  player.currentTime = saved.watched_seconds;
+                  setCurrentSecs(saved.watched_seconds);
+                  currentSecsRef.current = saved.watched_seconds;
+                } catch (_) {}
+              }, 300);
+            }
+          }
+        }
+      }),
+
+      player.addListener("timeUpdate", ({ currentTime }) => {
+        // Only update from events when NOT scrubbing — scrubber drives display
+        if (!isScrubbing.current) {
+          setCurrentSecs(currentTime);
+          currentSecsRef.current = currentTime;
+        }
+      }),
+
+      player.addListener("playToEnd", () => {
+        saveProgress(true);
+        setIsPlaying(false);
+        setShowControls(true);
+      }),
+    ];
+
+    return () => subs.forEach((s) => s.remove());
+  }, [player]);
+
+  // ── Progress saving ──────────────────────────────────────────────────────
+  const saveProgress = useCallback(
+    async (forceSave = false) => {
+      if (!user || !lessonRef.current) return;
+      const secs = currentSecsRef.current;
+      const dur = durationSecsRef.current;
+      if (!forceSave && Math.abs(secs - lastSavedRef.current) < 5) return;
+      const isCompleted = dur > 0 && secs / dur > 0.9;
+      const result = await upsertProgress(
+        user.id,
+        lessonRef.current.id,
+        secs,
+        isCompleted,
+      );
+      if (result) {
+        setProgress(lessonRef.current.id, result);
+        lastSavedRef.current = secs;
+      }
+    },
+    [user],
+  );
+
+  useEffect(() => {
+    if (isPlaying) {
+      saveTimerRef.current = setInterval(
+        () => saveProgress(),
+        SAVE_INTERVAL_MS,
+      );
+    } else {
+      if (saveTimerRef.current) clearInterval(saveTimerRef.current);
+    }
+    return () => {
+      if (saveTimerRef.current) clearInterval(saveTimerRef.current);
+    };
+  }, [isPlaying, saveProgress]);
+
+  // Save + restore portrait on unmount
+  useEffect(() => {
+    return () => {
+      saveProgress(true);
+      if (saveTimerRef.current) clearInterval(saveTimerRef.current);
+      if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current);
+      ScreenOrientation.lockAsync(
+        ScreenOrientation.OrientationLock.PORTRAIT_UP,
+      ).catch(() => {});
+    };
+  }, [saveProgress]);
+
+  // ── Controls auto-hide ───────────────────────────────────────────────────
+  const resetControlsTimer = useCallback(() => {
+    if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current);
+    controlsTimerRef.current = setTimeout(
+      () => setShowControls(false),
+      CONTROLS_HIDE_MS,
+    );
+  }, []);
+
+  const handleVideoTap = () => {
+    setShowControls((v) => {
+      if (!v) resetControlsTimer();
+      return !v;
+    });
   };
 
-  return (
-    <View style={[styles.root, { paddingBottom: insets.bottom }]}>
-      {/* Dark header */}
-      <View style={[styles.header, { paddingTop: insets.top + Spacing[2] }]}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
-          <Text style={styles.backText}>✕</Text>
+  // ── Playback controls ────────────────────────────────────────────────────
+  const togglePlayPause = () => {
+    try {
+      if (player.playing) {
+        player.pause();
+      } else {
+        player.play();
+        resetControlsTimer();
+      }
+    } catch (_) {}
+  };
+
+  const skip = (deltaSecs: number) => {
+    try {
+      const newSecs = Math.max(
+        0,
+        Math.min(durationSecsRef.current, currentSecsRef.current + deltaSecs),
+      );
+      player.currentTime = newSecs;
+      setCurrentSecs(newSecs);
+      currentSecsRef.current = newSecs;
+      resetControlsTimer();
+    } catch (_) {}
+  };
+
+  const toggleMute = () => {
+    try {
+      player.muted = !player.muted;
+    } catch (_) {}
+  };
+
+  // ── Fullscreen ───────────────────────────────────────────────────────────
+  const toggleFullscreen = async () => {
+    try {
+      if (isFullscreen) {
+        await videoViewRef.current?.exitFullscreen();
+      } else {
+        await videoViewRef.current?.enterFullscreen();
+      }
+    } catch (_) {}
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // KEY FIX #2:
+  // Track scrubbing with a REF (not state) so the PanResponder callbacks
+  // always see the latest value without stale closures.
+  // Derive a single displaySecs value:
+  //   - While dragging → scrubPct * duration  (shows WHERE you're seeking to)
+  //   - Otherwise      → currentSecs          (shows live playback position)
+  // This way the left timestamp always matches the scrubber thumb.
+  // ─────────────────────────────────────────────────────────────────────────
+  const isScrubbing = useRef(false);
+  const [scrubPct, setScrubPct] = useState(0);
+  const scrubBarWidth = useRef(screenWidth - Layout.screenPaddingH * 2 - 64);
+
+  // What the scrubber thumb + left timestamp should show
+  const scrubProgress = isScrubbing.current
+    ? scrubPct
+    : durationSecs > 0
+      ? currentSecs / durationSecs
+      : 0;
+
+  const displaySecs = isScrubbing.current
+    ? scrubPct * durationSecs
+    : currentSecs;
+
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+
+      onPanResponderGrant: (e) => {
+        isScrubbing.current = true;
+        const pct = Math.max(
+          0,
+          Math.min(1, e.nativeEvent.locationX / scrubBarWidth.current),
+        );
+        setScrubPct(pct);
+      },
+
+      onPanResponderMove: (e) => {
+        const pct = Math.max(
+          0,
+          Math.min(1, e.nativeEvent.locationX / scrubBarWidth.current),
+        );
+        setScrubPct(pct);
+      },
+
+      onPanResponderRelease: (e) => {
+        const pct = Math.max(
+          0,
+          Math.min(1, e.nativeEvent.locationX / scrubBarWidth.current),
+        );
+        const newSecs = pct * durationSecsRef.current;
+
+        // Update display state immediately — before the seek event fires
+        setScrubPct(pct);
+        setCurrentSecs(newSecs);
+        currentSecsRef.current = newSecs;
+
+        // Seek the player
+        try {
+          player.currentTime = newSecs;
+        } catch (_) {}
+
+        // Release scrub mode AFTER state is set so display doesn't flicker
+        setTimeout(() => {
+          isScrubbing.current = false;
+          setScrubPct(0);
+        }, 80);
+
+        resetControlsTimer();
+      },
+
+      onPanResponderTerminate: () => {
+        isScrubbing.current = false;
+        setScrubPct(0);
+      },
+    }),
+  ).current;
+
+  // ── Derived display values ────────────────────────────────────────────────
+  const progressPct =
+    durationSecs > 0 ? Math.round((currentSecs / durationSecs) * 100) : 0;
+  const isBuffering = playerStatus === "loading";
+  const hasMuxUrl = !!lesson?.mux_playback_id;
+
+  // ── Render ───────────────────────────────────────────────────────────────
+  if (loading) {
+    return (
+      <View style={styles.loadingScreen}>
+        <ActivityIndicator color={Colors.primary} size="large" />
+      </View>
+    );
+  }
+
+  if (!lesson) {
+    return (
+      <View style={styles.loadingScreen}>
+        <Text style={styles.errorText}>Lesson not found.</Text>
+        <TouchableOpacity onPress={() => router.back()}>
+          <Text style={styles.errorLink}>← Go back</Text>
         </TouchableOpacity>
-        <Text style={styles.headerTitle} numberOfLines={1}>
-          {lesson.title}
-        </Text>
-        <View style={styles.backBtn} />
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.root}>
+      <StatusBar barStyle="light-content" backgroundColor="#0D0B09" />
+
+      {/* ── Video container ── */}
+      <View
+        style={[styles.videoWrapper, { height: videoH, marginTop: insets.top }]}
+      >
+        {hasMuxUrl ? (
+          <>
+            <VideoView
+              ref={videoViewRef}
+              player={player}
+              style={styles.video}
+              contentFit="contain"
+              nativeControls={false}
+              fullscreenOptions={{ enable: false, orientation: "landscape" }}
+              onFullscreenEnter={() => setIsFullscreen(true)}
+              onFullscreenExit={() => setIsFullscreen(false)}
+            />
+
+            {/* Buffering overlay */}
+            {isBuffering && (
+              <View style={styles.bufferingOverlay}>
+                <ActivityIndicator color={Colors.white} size="large" />
+              </View>
+            )}
+
+            {/* Tap area + custom controls */}
+            <TouchableWithoutFeedback onPress={handleVideoTap}>
+              <View style={StyleSheet.absoluteFill}>
+                {showControls && (
+                  <LinearGradient
+                    colors={[
+                      "rgba(0,0,0,0.72)",
+                      "transparent",
+                      "transparent",
+                      "rgba(0,0,0,0.82)",
+                    ]}
+                    locations={[0, 0.28, 0.65, 1]}
+                    style={StyleSheet.absoluteFill}
+                    pointerEvents="box-none"
+                  >
+                    {/* Top bar */}
+                    <View style={styles.topBar}>
+                      <TouchableOpacity
+                        onPress={() => router.back()}
+                        style={styles.iconBtn}
+                        hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                      >
+                        <Text style={styles.iconText}>✕</Text>
+                      </TouchableOpacity>
+                      <Text style={styles.videoTitle} numberOfLines={1}>
+                        {lesson.title}
+                      </Text>
+                      <TouchableOpacity
+                        onPress={toggleMute}
+                        style={styles.iconBtn}
+                        hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                      >
+                        <Text style={styles.iconText}>
+                          {isMuted ? "🔇" : "🔊"}
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    {/* Centre controls */}
+                    <View style={styles.centerRow} pointerEvents="box-none">
+                      <TouchableOpacity
+                        onPress={() => skip(-10)}
+                        style={styles.skipBtn}
+                        hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}
+                      >
+                        <Text style={styles.skipEmoji}>⏪</Text>
+                        <Text style={styles.skipLabel}>10</Text>
+                      </TouchableOpacity>
+
+                      <TouchableOpacity
+                        onPress={togglePlayPause}
+                        style={styles.playBtn}
+                      >
+                        <Text style={styles.playIcon}>
+                          {isPlaying ? "⏸" : "▶"}
+                        </Text>
+                      </TouchableOpacity>
+
+                      <TouchableOpacity
+                        onPress={() => skip(10)}
+                        style={styles.skipBtn}
+                        hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}
+                      >
+                        <Text style={styles.skipEmoji}>⏩</Text>
+                        <Text style={styles.skipLabel}>10</Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    {/* Bottom bar — timestamp uses displaySecs for sync */}
+                    <View style={styles.bottomBar}>
+                      <Text style={styles.timeLabel}>
+                        {formatDuration(displaySecs)}
+                      </Text>
+
+                      {/* Scrubber */}
+                      <View
+                        style={styles.scrubberTrack}
+                        {...panResponder.panHandlers}
+                        onLayout={(e) => {
+                          scrubBarWidth.current = e.nativeEvent.layout.width;
+                        }}
+                      >
+                        <View style={styles.trackBg} />
+                        <View
+                          style={[
+                            styles.trackFill,
+                            { width: `${scrubProgress * 100}%` },
+                          ]}
+                        />
+                        <View
+                          style={[
+                            styles.thumb,
+                            { left: `${Math.min(scrubProgress * 100, 98)}%` },
+                          ]}
+                        />
+                      </View>
+
+                      <Text style={styles.timeLabel}>
+                        {formatDuration(durationSecs)}
+                      </Text>
+
+                      <TouchableOpacity
+                        onPress={toggleFullscreen}
+                        style={styles.iconBtn}
+                        hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                      >
+                        <Text style={styles.iconText}>
+                          {isFullscreen ? "⊡" : "⊞"}
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+                  </LinearGradient>
+                )}
+              </View>
+            </TouchableWithoutFeedback>
+          </>
+        ) : (
+          <View style={styles.placeholder}>
+            <Text style={styles.placeholderEmoji}>🎬</Text>
+            <Text style={styles.placeholderTitle}>Video Coming Soon</Text>
+            <Text style={styles.placeholderSub}>
+              This lesson hasn't been uploaded yet.{"\n"}Check back later.
+            </Text>
+            <TouchableOpacity
+              onPress={() => router.back()}
+              style={{ marginTop: Spacing[3] }}
+            >
+              <Text style={styles.errorLink}>← Go back</Text>
+            </TouchableOpacity>
+          </View>
+        )}
       </View>
 
-      {/* 16:9 video placeholder */}
-      <View style={[styles.videoBox, { height: VIDEO_H }]}>
-        <View style={styles.playCircle}>
-          <Text style={styles.playIcon}>▶</Text>
-        </View>
-        <Text style={styles.videoPlaceholderText}>
-          Video Player — Coming in Phase 4
+      {/* ── Info panel ── */}
+      <ScrollView
+        style={styles.infoPanel}
+        contentContainerStyle={[
+          styles.infoPanelContent,
+          { paddingBottom: insets.bottom + Spacing[8] },
+        ]}
+        showsVerticalScrollIndicator={false}
+      >
+        <Text style={styles.breadcrumb}>
+          {lesson.subject_title} › {lesson.chapter_title}
         </Text>
-      </View>
-
-      {/* Lesson info */}
-      <View style={styles.infoCard}>
-        <Text style={styles.chapterBreadcrumb}>📚 {lesson.chapter}</Text>
         <Text style={styles.lessonTitle}>{lesson.title}</Text>
+
+        {/* Meta pills */}
         <View style={styles.metaRow}>
           <View style={styles.metaPill}>
-            <Text style={styles.metaText}>⏱️ {lesson.duration}</Text>
+            <Text style={styles.metaText}>
+              ⏱️ {formatDuration(lesson.duration_seconds)}
+            </Text>
           </View>
-          <View style={styles.metaPill}>
-            <Text style={styles.metaText}>🆓 Free Preview</Text>
-          </View>
+          {progressPct > 0 && (
+            <View style={[styles.metaPill, styles.metaPillPrimary]}>
+              <Text style={[styles.metaText, { color: Colors.primary }]}>
+                {progressPct >= 90
+                  ? "✅  Completed"
+                  : `▶  ${progressPct}% watched`}
+              </Text>
+            </View>
+          )}
+          {lesson.is_free && (
+            <View style={[styles.metaPill, styles.metaPillFree]}>
+              <Text style={[styles.metaText, { color: Colors.success }]}>
+                🆓 Free
+              </Text>
+            </View>
+          )}
         </View>
 
-        {/* Progress */}
-        <View style={styles.progressSection}>
-          <View style={styles.progressHeader}>
-            <Text style={styles.progressLabel}>Your progress</Text>
-            <Text style={styles.progressPct}>0%</Text>
-          </View>
+        {/* Progress bar */}
+        {durationSecs > 0 && progressPct > 0 && (
           <View style={styles.progressBarBg}>
-            <View style={[styles.progressBarFill, { width: "0%" }]} />
+            <View
+              style={[styles.progressBarFill, { width: `${progressPct}%` }]}
+            />
           </View>
-        </View>
+        )}
 
         {/* Description */}
-        <Text style={styles.descLabel}>ABOUT THIS LESSON</Text>
-        <Text style={styles.descText}>
-          This lesson covers key concepts and historical events relevant to
-          competitive exams. Watch the full video and review the notes to
-          maximize retention before your exam.
-        </Text>
-      </View>
+        {!!lesson.description && (
+          <View style={styles.descCard}>
+            <Text style={styles.descLabel}>ABOUT THIS LESSON</Text>
+            <Text style={styles.descText}>{lesson.description}</Text>
+          </View>
+        )}
+
+        {/* More in chapter */}
+        {chapterLessons.length > 1 && (
+          <View style={styles.moreCard}>
+            <Text style={styles.moreSectionTitle}>More in this chapter</Text>
+            {chapterLessons.slice(0, 5).map((l) => {
+              const isCurrent = l.id === lesson.id;
+              const isLocked = !l.is_free && !profile?.is_paid;
+              const prog = useProgressStore.getState().progressMap[l.id];
+              const pct =
+                l.duration_seconds > 0 && prog
+                  ? Math.round(
+                      (prog.watched_seconds / l.duration_seconds) * 100,
+                    )
+                  : 0;
+
+              return (
+                <TouchableOpacity
+                  key={l.id}
+                  style={[styles.moreRow, isCurrent && styles.moreRowCurrent]}
+                  onPress={() => {
+                    if (isLocked) {
+                      router.push("/course-info");
+                      return;
+                    }
+                    if (!isCurrent) router.replace(`/lesson/${l.id}`);
+                  }}
+                  activeOpacity={isCurrent ? 1 : 0.8}
+                  disabled={isCurrent}
+                >
+                  <View
+                    style={[
+                      styles.moreIcon,
+                      isCurrent && styles.moreIconCurrent,
+                    ]}
+                  >
+                    <Text style={styles.moreIconText}>
+                      {isLocked ? "🔒" : isCurrent ? "▶" : "○"}
+                    </Text>
+                  </View>
+                  <View style={styles.moreInfo}>
+                    <Text
+                      style={[
+                        styles.moreTitle,
+                        isCurrent && { color: Colors.primary },
+                        isLocked && { color: Colors.muted },
+                      ]}
+                      numberOfLines={1}
+                    >
+                      {l.title}
+                    </Text>
+                    <Text style={styles.moreMeta}>
+                      {formatDuration(l.duration_seconds)}
+                      {pct > 0 ? `  ·  ${pct}%` : ""}
+                      {l.is_free ? "  ·  Free" : ""}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        )}
+      </ScrollView>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: Colors.text },
-  header: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: Layout.screenPaddingH,
-    paddingBottom: Spacing[3],
-    backgroundColor: Colors.text,
-  },
-  backBtn: { width: 40, alignItems: "center" },
-  backText: {
-    fontFamily: FontFamily.latoBold,
-    fontSize: FontSize.lg,
-    color: Colors.white,
-  },
-  headerTitle: {
+  root: { flex: 1, backgroundColor: "#0D0B09" },
+  loadingScreen: {
     flex: 1,
-    textAlign: "center",
-    fontFamily: FontFamily.latoBold,
-    fontSize: FontSize.base,
-    color: Colors.white,
-  },
-  videoBox: {
-    width: SCREEN_W,
-    backgroundColor: "#2A2724",
+    backgroundColor: "#0D0B09",
     alignItems: "center",
     justifyContent: "center",
     gap: Spacing[4],
   },
-  playCircle: {
-    width: 72,
-    height: 72,
-    borderRadius: 36,
-    backgroundColor: Colors.primary + "CC",
+  errorText: {
+    fontFamily: FontFamily.lato,
+    fontSize: FontSize.base,
+    color: Colors.white,
+  },
+  errorLink: {
+    fontFamily: FontFamily.latoBold,
+    fontSize: FontSize.base,
+    color: Colors.primary,
+  },
+
+  videoWrapper: {
+    width: "100%",
+    backgroundColor: "#0D0B09",
+    overflow: "hidden",
+  },
+  video: { width: "100%", height: "100%" },
+
+  placeholder: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: Spacing[4],
+  },
+  placeholderEmoji: { fontSize: 52 },
+  placeholderTitle: {
+    fontFamily: FontFamily.playfairBold,
+    fontSize: FontSize.xl,
+    color: Colors.white,
+  },
+  placeholderSub: {
+    fontFamily: FontFamily.lato,
+    fontSize: FontSize.base,
+    color: Colors.white + "66",
+    textAlign: "center",
+    lineHeight: FontSize.base * 1.6,
+  },
+
+  bufferingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(0,0,0,0.35)",
+  },
+
+  topBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: Spacing[4],
+    paddingTop: Spacing[3],
+    paddingBottom: Spacing[2],
+    gap: Spacing[3],
+  },
+  videoTitle: {
+    flex: 1,
+    fontFamily: FontFamily.latoBold,
+    fontSize: FontSize.base,
+    color: Colors.white,
+    textAlign: "center",
+  },
+  centerRow: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: Spacing[10],
+  },
+  skipBtn: { alignItems: "center", gap: 2 },
+  skipEmoji: { fontSize: 24, color: Colors.white },
+  skipLabel: {
+    fontFamily: FontFamily.latoBold,
+    fontSize: FontSize.xs,
+    color: Colors.white + "BB",
+  },
+  playBtn: {
+    width: 68,
+    height: 68,
+    borderRadius: 34,
+    backgroundColor: "rgba(255,255,255,0.18)",
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.5)",
     alignItems: "center",
     justifyContent: "center",
   },
-  playIcon: { fontSize: 28, color: Colors.white, marginLeft: 4 },
-  videoPlaceholderText: {
-    fontFamily: FontFamily.lato,
-    fontSize: FontSize.sm,
-    color: Colors.white + "55",
+  playIcon: { fontSize: 28, color: Colors.white, marginLeft: 3 },
+  iconBtn: {
+    width: 36,
+    height: 36,
+    alignItems: "center",
+    justifyContent: "center",
   },
-  infoCard: {
+  iconText: { fontSize: 20, color: Colors.white },
+  bottomBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: Spacing[4],
+    paddingBottom: Spacing[4],
+    gap: Spacing[2],
+  },
+  timeLabel: {
+    fontFamily: FontFamily.latoBold,
+    fontSize: FontSize.xs,
+    color: Colors.white,
+    minWidth: 38,
+    textAlign: "center",
+  },
+  scrubberTrack: {
     flex: 1,
-    backgroundColor: Colors.background,
-    borderTopLeftRadius: Radii["2xl"],
-    borderTopRightRadius: Radii["2xl"],
-    marginTop: -Radii["2xl"],
-    padding: Layout.screenPaddingH,
-    paddingTop: Spacing[6],
+    height: 28,
+    justifyContent: "center",
+    position: "relative",
   },
-  chapterBreadcrumb: {
+  trackBg: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    height: 3,
+    backgroundColor: "rgba(255,255,255,0.35)",
+    borderRadius: Radii.full,
+  },
+  trackFill: {
+    position: "absolute",
+    left: 0,
+    height: 3,
+    backgroundColor: Colors.accent,
+    borderRadius: Radii.full,
+  },
+  thumb: {
+    position: "absolute",
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: Colors.white,
+    marginLeft: -7,
+    top: "50%",
+    marginTop: -7,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.5,
+    shadowRadius: 2,
+    elevation: 3,
+  },
+
+  infoPanel: { flex: 1, backgroundColor: Colors.background },
+  infoPanelContent: {
+    paddingHorizontal: Layout.screenPaddingH,
+    paddingTop: Spacing[5],
+  },
+  breadcrumb: {
     fontFamily: FontFamily.lato,
-    fontSize: FontSize.sm,
-    color: Colors.muted,
+    fontSize: FontSize.xs,
+    color: Colors.primary,
+    letterSpacing: 0.3,
     marginBottom: Spacing[2],
   },
   lessonTitle: {
     fontFamily: FontFamily.playfairBold,
     fontSize: FontSize["2xl"],
     color: Colors.text,
+    lineHeight: FontSize["2xl"] * 1.1,
     marginBottom: Spacing[4],
   },
-  metaRow: { flexDirection: "row", gap: Spacing[3], marginBottom: Spacing[5] },
+  metaRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: Spacing[2],
+    marginBottom: Spacing[4],
+  },
   metaPill: {
     paddingHorizontal: Spacing[3],
     paddingVertical: Spacing[1] + 2,
@@ -195,37 +874,37 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: Colors.border,
   },
+  metaPillPrimary: {
+    backgroundColor: Colors.primary + "15",
+    borderColor: Colors.primary + "40",
+  },
+  metaPillFree: {
+    backgroundColor: Colors.success + "15",
+    borderColor: Colors.success + "40",
+  },
   metaText: {
     fontFamily: FontFamily.latoBold,
     fontSize: FontSize.sm,
     color: Colors.muted,
   },
-  progressSection: { marginBottom: Spacing[5] },
-  progressHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginBottom: Spacing[2],
-  },
-  progressLabel: {
-    fontFamily: FontFamily.lato,
-    fontSize: FontSize.sm,
-    color: Colors.muted,
-  },
-  progressPct: {
-    fontFamily: FontFamily.latoBold,
-    fontSize: FontSize.sm,
-    color: Colors.primary,
-  },
   progressBarBg: {
-    height: 6,
+    height: 4,
     backgroundColor: Colors.border,
     borderRadius: Radii.full,
+    marginBottom: Spacing[5],
     overflow: "hidden",
   },
   progressBarFill: {
-    height: 6,
+    height: 4,
     backgroundColor: Colors.primary,
     borderRadius: Radii.full,
+  },
+  descCard: {
+    backgroundColor: Colors.surface,
+    borderRadius: Radii.xl,
+    padding: Spacing[5],
+    marginBottom: Spacing[5],
+    ...Shadows.sm,
   },
   descLabel: {
     fontFamily: FontFamily.latoBold,
@@ -240,554 +919,50 @@ const styles = StyleSheet.create({
     color: Colors.muted,
     lineHeight: FontSize.base * 1.6,
   },
+  moreCard: {
+    backgroundColor: Colors.surface,
+    borderRadius: Radii.xl,
+    overflow: "hidden",
+    marginBottom: Spacing[4],
+    ...Shadows.sm,
+  },
+  moreSectionTitle: {
+    fontFamily: FontFamily.playfairBold,
+    fontSize: FontSize.lg,
+    color: Colors.text,
+    padding: Spacing[4],
+    paddingBottom: Spacing[3],
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.border,
+  },
+  moreRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: Spacing[3],
+    padding: Spacing[4],
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.border + "50",
+  },
+  moreRowCurrent: { backgroundColor: Colors.primary + "08" },
+  moreIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: Colors.border,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  moreIconCurrent: { backgroundColor: Colors.primary + "25" },
+  moreIconText: { fontSize: 15 },
+  moreInfo: { flex: 1, gap: 2 },
+  moreTitle: {
+    fontFamily: FontFamily.latoBold,
+    fontSize: FontSize.base,
+    color: Colors.text,
+  },
+  moreMeta: {
+    fontFamily: FontFamily.lato,
+    fontSize: FontSize.xs,
+    color: Colors.muted,
+  },
 });
-
-// // Mux-powered video player screen
-// import React, { useEffect, useRef, useState, useCallback } from 'react';
-// import {
-//   View, Text, StyleSheet, TouchableOpacity, Dimensions,
-//   StatusBar, Platform, ActivityIndicator, ScrollView,
-// } from 'react-native';
-// import { router, useLocalSearchParams } from 'expo-router';
-// import { LinearGradient } from 'expo-linear-gradient';
-// import { useSafeAreaInsets } from 'react-native-safe-area-context';
-// import { Video, ResizeMode, AVPlaybackStatus } from 'expo-av';
-// import * as ScreenOrientation from 'expo-screen-orientation';
-// import { useAuthStore, useProgressStore } from '../../lib/store';
-// import { supabase, upsertProgress, getLessons } from '../../lib/supabase';
-// import { Colors, Typography, Radii, Shadows } from '../../constants/theme';
-// import { formatDuration } from '../../lib/utils';
-
-// const { width: SCREEN_WIDTH } = Dimensions.get('window');
-// const VIDEO_HEIGHT = SCREEN_WIDTH * (9 / 16); // 16:9 aspect ratio
-
-// // ── Mux stream URL builder ───────────────────────────────────────────────────
-// function getMuxStreamUrl(playbackId: string) {
-//   return `https://stream.mux.com/${playbackId}.m3u8`;
-// }
-// function getMuxThumbnail(playbackId: string) {
-//   return `https://image.mux.com/${playbackId}/thumbnail.jpg?time=5`;
-// }
-
-// export default function LessonScreen() {
-//   const { id } = useLocalSearchParams<{ id: string }>();
-//   const insets = useSafeAreaInsets();
-//   const { profile } = useAuthStore();
-//   const { setProgress } = useProgressStore();
-
-//   const videoRef = useRef<Video>(null);
-//   const progressSaveTimer = useRef<NodeJS.Timeout | null>(null);
-
-//   const [lesson, setLesson] = useState<any>(null);
-//   const [relatedLessons, setRelatedLessons] = useState<any[]>([]);
-//   const [loading, setLoading] = useState(true);
-//   const [isPlaying, setIsPlaying] = useState(false);
-//   const [isBuffering, setIsBuffering] = useState(false);
-//   const [currentTime, setCurrentTime] = useState(0);
-//   const [duration, setDuration] = useState(0);
-//   const [showControls, setShowControls] = useState(true);
-//   const [isFullscreen, setIsFullscreen] = useState(false);
-//   const [isMuted, setIsMuted] = useState(false);
-//   const controlsTimer = useRef<NodeJS.Timeout | null>(null);
-
-//   useEffect(() => {
-//     loadLesson();
-//     return () => {
-//       // Save progress on unmount
-//       if (progressSaveTimer.current) clearTimeout(progressSaveTimer.current);
-//       saveProgress(currentTime);
-//     };
-//   }, [id]);
-
-//   const loadLesson = async () => {
-//     const { data } = await supabase
-//       .from('lessons')
-//       .select('*, chapters(id, title, subject_id)')
-//       .eq('id', id)
-//       .single();
-//     setLesson(data);
-
-//     if (data?.chapter_id) {
-//       const lessons = await getLessons(data.chapter_id);
-//       setRelatedLessons(lessons.filter((l: any) => l.id !== id));
-//     }
-//     setLoading(false);
-//   };
-
-//   const saveProgress = useCallback(async (watchedSecs: number) => {
-//     if (!profile?.id || !id || watchedSecs < 5) return;
-//     const isCompleted = duration > 0 && watchedSecs / duration > 0.9;
-//     await upsertProgress(profile.id, id, Math.floor(watchedSecs), isCompleted);
-//     setProgress(id, {
-//       id: '',
-//       user_id: profile.id,
-//       lesson_id: id,
-//       watched_seconds: Math.floor(watchedSecs),
-//       is_completed: isCompleted,
-//       last_watched_at: new Date().toISOString(),
-//     });
-//   }, [profile, id, duration]);
-
-//   const handlePlaybackStatus = (status: AVPlaybackStatus) => {
-//     if (!status.isLoaded) return;
-//     setIsPlaying(status.isPlaying);
-//     setIsBuffering(status.isBuffering);
-//     setCurrentTime(status.positionMillis / 1000);
-//     if (status.durationMillis) setDuration(status.durationMillis / 1000);
-
-//     // Auto-save progress every 10 seconds
-//     if (status.isPlaying) {
-//       if (progressSaveTimer.current) clearTimeout(progressSaveTimer.current);
-//       progressSaveTimer.current = setTimeout(() => {
-//         saveProgress(status.positionMillis / 1000);
-//       }, 10000);
-//     }
-//   };
-
-//   const togglePlay = async () => {
-//     if (!videoRef.current) return;
-//     if (isPlaying) {
-//       await videoRef.current.pauseAsync();
-//     } else {
-//       await videoRef.current.playAsync();
-//     }
-//     showControlsTemporarily();
-//   };
-
-//   const seek = async (seconds: number) => {
-//     if (!videoRef.current) return;
-//     const newTime = Math.max(0, Math.min(currentTime + seconds, duration));
-//     await videoRef.current.setPositionAsync(newTime * 1000);
-//     showControlsTemporarily();
-//   };
-
-//   const showControlsTemporarily = () => {
-//     setShowControls(true);
-//     if (controlsTimer.current) clearTimeout(controlsTimer.current);
-//     controlsTimer.current = setTimeout(() => setShowControls(false), 3500);
-//   };
-
-//   const toggleFullscreen = async () => {
-//     if (!isFullscreen) {
-//       await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE);
-//     } else {
-//       await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT);
-//     }
-//     setIsFullscreen(!isFullscreen);
-//   };
-
-//   const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
-
-//   if (loading) {
-//     return (
-//       <View style={styles.loadingContainer}>
-//         <ActivityIndicator size="large" color={Colors.primary} />
-//       </View>
-//     );
-//   }
-
-//   return (
-//     <View style={styles.container}>
-//       <StatusBar hidden={isFullscreen} />
-
-//       {/* ── Video Player ── */}
-//       <TouchableOpacity
-//         style={[styles.videoWrapper, isFullscreen && styles.videoWrapperFullscreen]}
-//         activeOpacity={1}
-//         onPress={showControlsTemporarily}
-//       >
-//         {lesson?.mux_playback_id ? (
-//           <Video
-//             ref={videoRef}
-//             source={{ uri: getMuxStreamUrl(lesson.mux_playback_id) }}
-//             style={styles.video}
-//             resizeMode={ResizeMode.CONTAIN}
-//             onPlaybackStatusUpdate={handlePlaybackStatus}
-//             shouldPlay={false}
-//             isLooping={false}
-//             isMuted={isMuted}
-//             useNativeControls={false}
-//           />
-//         ) : (
-//           /* Placeholder when no Mux ID is set yet */
-//           <LinearGradient
-//             colors={['#1C1A17', '#3D2B1F']}
-//             style={styles.videoPlaceholder}
-//           >
-//             <Text style={styles.placeholderEmoji}>🎬</Text>
-//             <Text style={styles.placeholderText}>Video not available yet</Text>
-//           </LinearGradient>
-//         )}
-
-//         {/* Buffering indicator */}
-//         {isBuffering && (
-//           <View style={styles.bufferingOverlay}>
-//             <ActivityIndicator size="large" color="#FFFFFF" />
-//           </View>
-//         )}
-
-//         {/* Controls overlay */}
-//         {showControls && (
-//           <View style={styles.controlsOverlay}>
-//             {/* Top bar */}
-//             <LinearGradient
-//               colors={['rgba(0,0,0,0.7)', 'transparent']}
-//               style={styles.controlsTop}
-//             >
-//               <TouchableOpacity onPress={() => router.back()} style={styles.controlBtn}>
-//                 <Text style={styles.controlIcon}>✕</Text>
-//               </TouchableOpacity>
-//               <Text style={styles.controlTitle} numberOfLines={1}>
-//                 {lesson?.title}
-//               </Text>
-//               <TouchableOpacity onPress={() => setIsMuted(!isMuted)} style={styles.controlBtn}>
-//                 <Text style={styles.controlIcon}>{isMuted ? '🔇' : '🔊'}</Text>
-//               </TouchableOpacity>
-//             </LinearGradient>
-
-//             {/* Center controls */}
-//             <View style={styles.controlsCenter}>
-//               <TouchableOpacity style={styles.skipBtn} onPress={() => seek(-10)}>
-//                 <Text style={styles.skipIcon}>⏪</Text>
-//                 <Text style={styles.skipLabel}>10s</Text>
-//               </TouchableOpacity>
-
-//               <TouchableOpacity style={styles.playPauseBtn} onPress={togglePlay}>
-//                 <Text style={styles.playPauseIcon}>{isPlaying ? '⏸' : '▶'}</Text>
-//               </TouchableOpacity>
-
-//               <TouchableOpacity style={styles.skipBtn} onPress={() => seek(10)}>
-//                 <Text style={styles.skipIcon}>⏩</Text>
-//                 <Text style={styles.skipLabel}>10s</Text>
-//               </TouchableOpacity>
-//             </View>
-
-//             {/* Bottom bar: progress + time + fullscreen */}
-//             <LinearGradient
-//               colors={['transparent', 'rgba(0,0,0,0.7)']}
-//               style={styles.controlsBottom}
-//             >
-//               <View style={styles.progressRow}>
-//                 <Text style={styles.timeText}>{formatDuration(currentTime)}</Text>
-//                 <View style={styles.progressTrack}>
-//                   <View style={[styles.progressFill, { width: `${progressPercent}%` }]} />
-//                   <View style={[styles.progressThumb, { left: `${progressPercent}%` }]} />
-//                 </View>
-//                 <Text style={styles.timeText}>{formatDuration(duration)}</Text>
-//               </View>
-
-//               <TouchableOpacity onPress={toggleFullscreen} style={styles.fullscreenBtn}>
-//                 <Text style={styles.controlIcon}>{isFullscreen ? '⊡' : '⊞'}</Text>
-//               </TouchableOpacity>
-//             </LinearGradient>
-//           </View>
-//         )}
-//       </TouchableOpacity>
-
-//       {/* ── Lesson Info & Related (only in portrait) ── */}
-//       {!isFullscreen && (
-//         <ScrollView
-//           contentContainerStyle={[styles.infoArea, { paddingBottom: insets.bottom + 24 }]}
-//           showsVerticalScrollIndicator={false}
-//         >
-//           {/* Lesson title */}
-//           <View style={styles.lessonHeader}>
-//             <Text style={styles.chapterLabel}>
-//               {lesson?.chapters?.title}
-//             </Text>
-//             <Text style={styles.lessonTitle}>{lesson?.title}</Text>
-//             <View style={styles.durationRow}>
-//               <Text style={styles.durationText}>🕐 {formatDuration(lesson?.duration_seconds ?? 0)}</Text>
-//               {progressPercent > 0 && (
-//                 <Text style={styles.progressText}>
-//                   {Math.round(progressPercent)}% watched
-//                 </Text>
-//               )}
-//             </View>
-//           </View>
-
-//           {/* Description */}
-//           {lesson?.description && (
-//             <View style={styles.descriptionCard}>
-//               <Text style={styles.descriptionTitle}>About this lesson</Text>
-//               <Text style={styles.descriptionText}>{lesson.description}</Text>
-//             </View>
-//           )}
-
-//           {/* Related lessons */}
-//           {relatedLessons.length > 0 && (
-//             <View style={styles.relatedSection}>
-//               <Text style={styles.relatedTitle}>More in this chapter</Text>
-//               {relatedLessons.slice(0, 5).map((related, idx) => (
-//                 <TouchableOpacity
-//                   key={related.id}
-//                   style={styles.relatedCard}
-//                   onPress={() => {
-//                     if (!related.is_free && !profile?.is_paid) {
-//                       router.push('/course-info');
-//                       return;
-//                     }
-//                     router.replace(`/lesson/${related.id}`);
-//                   }}
-//                 >
-//                   <View style={[
-//                     styles.relatedNum,
-//                     (!related.is_free && !profile?.is_paid) && styles.relatedNumLocked,
-//                   ]}>
-//                     <Text style={styles.relatedNumText}>
-//                       {(!related.is_free && !profile?.is_paid) ? '🔒' : `${idx + 1}`}
-//                     </Text>
-//                   </View>
-//                   <View style={styles.relatedInfo}>
-//                     <Text style={styles.relatedName} numberOfLines={1}>{related.title}</Text>
-//                     <Text style={styles.relatedDuration}>{formatDuration(related.duration_seconds)}</Text>
-//                   </View>
-//                 </TouchableOpacity>
-//               ))}
-//             </View>
-//           )}
-//         </ScrollView>
-//       )}
-//     </View>
-//   );
-// }
-
-// const styles = StyleSheet.create({
-//   container: { flex: 1, backgroundColor: '#1C1A17' },
-//   loadingContainer: {
-//     flex: 1,
-//     backgroundColor: Colors.background,
-//     justifyContent: 'center',
-//     alignItems: 'center',
-//   },
-
-//   // Video
-//   videoWrapper: {
-//     width: SCREEN_WIDTH,
-//     height: VIDEO_HEIGHT,
-//     backgroundColor: '#000',
-//     position: 'relative',
-//   },
-//   videoWrapperFullscreen: {
-//     flex: 1,
-//     height: undefined,
-//   },
-//   video: {
-//     width: '100%',
-//     height: '100%',
-//   },
-//   videoPlaceholder: {
-//     flex: 1,
-//     alignItems: 'center',
-//     justifyContent: 'center',
-//     gap: 12,
-//   },
-//   placeholderEmoji: { fontSize: 48 },
-//   placeholderText: {
-//     fontFamily: Typography.body,
-//     fontSize: Typography.size.base,
-//     color: 'rgba(255,255,255,0.6)',
-//   },
-//   bufferingOverlay: {
-//     ...StyleSheet.absoluteFillObject,
-//     alignItems: 'center',
-//     justifyContent: 'center',
-//     backgroundColor: 'rgba(0,0,0,0.3)',
-//   },
-
-//   // Controls
-//   controlsOverlay: {
-//     ...StyleSheet.absoluteFillObject,
-//     justifyContent: 'space-between',
-//   },
-//   controlsTop: {
-//     flexDirection: 'row',
-//     alignItems: 'center',
-//     paddingHorizontal: 12,
-//     paddingTop: Platform.OS === 'ios' ? 48 : 16,
-//     paddingBottom: 20,
-//     gap: 12,
-//   },
-//   controlsCenter: {
-//     flexDirection: 'row',
-//     alignItems: 'center',
-//     justifyContent: 'center',
-//     gap: 40,
-//   },
-//   controlsBottom: {
-//     paddingHorizontal: 16,
-//     paddingBottom: 12,
-//     gap: 8,
-//   },
-//   controlBtn: {
-//     width: 36,
-//     height: 36,
-//     alignItems: 'center',
-//     justifyContent: 'center',
-//   },
-//   controlIcon: { fontSize: 18, color: '#FFFFFF' },
-//   controlTitle: {
-//     flex: 1,
-//     fontFamily: Typography.bodyMedium,
-//     fontSize: Typography.size.sm,
-//     color: '#FFFFFF',
-//     textAlign: 'center',
-//   },
-//   skipBtn: { alignItems: 'center', gap: 4 },
-//   skipIcon: { fontSize: 28, color: '#FFFFFF' },
-//   skipLabel: {
-//     fontFamily: Typography.body,
-//     fontSize: Typography.size.xs,
-//     color: 'rgba(255,255,255,0.7)',
-//   },
-//   playPauseBtn: {
-//     width: 64,
-//     height: 64,
-//     borderRadius: 32,
-//     backgroundColor: 'rgba(255,255,255,0.2)',
-//     alignItems: 'center',
-//     justifyContent: 'center',
-//     borderWidth: 2,
-//     borderColor: 'rgba(255,255,255,0.5)',
-//   },
-//   playPauseIcon: { fontSize: 28, color: '#FFFFFF' },
-//   progressRow: {
-//     flexDirection: 'row',
-//     alignItems: 'center',
-//     gap: 10,
-//   },
-//   timeText: {
-//     fontFamily: Typography.body,
-//     fontSize: Typography.size.xs,
-//     color: 'rgba(255,255,255,0.8)',
-//     width: 40,
-//   },
-//   progressTrack: {
-//     flex: 1,
-//     height: 4,
-//     backgroundColor: 'rgba(255,255,255,0.3)',
-//     borderRadius: 2,
-//     position: 'relative',
-//   },
-//   progressFill: {
-//     height: 4,
-//     backgroundColor: Colors.accent,
-//     borderRadius: 2,
-//   },
-//   progressThumb: {
-//     position: 'absolute',
-//     width: 12,
-//     height: 12,
-//     borderRadius: 6,
-//     backgroundColor: Colors.accent,
-//     top: -4,
-//     marginLeft: -6,
-//   },
-//   fullscreenBtn: { alignSelf: 'flex-end' },
-
-//   // Lesson info
-//   infoArea: {
-//     backgroundColor: Colors.background,
-//     paddingTop: 20,
-//     paddingHorizontal: 20,
-//     gap: 20,
-//     flexGrow: 1,
-//   },
-//   lessonHeader: { gap: 8 },
-//   chapterLabel: {
-//     fontFamily: Typography.body,
-//     fontSize: Typography.size.xs,
-//     color: Colors.primary,
-//     textTransform: 'uppercase',
-//     letterSpacing: 1,
-//   },
-//   lessonTitle: {
-//     fontFamily: Typography.heading,
-//     fontSize: Typography.size['2xl'],
-//     color: Colors.textPrimary,
-//     lineHeight: 34,
-//   },
-//   durationRow: {
-//     flexDirection: 'row',
-//     alignItems: 'center',
-//     gap: 14,
-//   },
-//   durationText: {
-//     fontFamily: Typography.body,
-//     fontSize: Typography.size.sm,
-//     color: Colors.textMuted,
-//   },
-//   progressText: {
-//     fontFamily: Typography.bodyMedium,
-//     fontSize: Typography.size.sm,
-//     color: Colors.accent,
-//   },
-
-//   // Description
-//   descriptionCard: {
-//     backgroundColor: Colors.surface,
-//     borderRadius: Radii.lg,
-//     padding: 16,
-//     borderWidth: 1,
-//     borderColor: Colors.border,
-//     gap: 8,
-//     ...Shadows.sm,
-//   },
-//   descriptionTitle: {
-//     fontFamily: Typography.bodyMedium,
-//     fontSize: Typography.size.base,
-//     color: Colors.textPrimary,
-//   },
-//   descriptionText: {
-//     fontFamily: Typography.body,
-//     fontSize: Typography.size.sm,
-//     color: Colors.textSecondary,
-//     lineHeight: 22,
-//   },
-
-//   // Related
-//   relatedSection: { gap: 12 },
-//   relatedTitle: {
-//     fontFamily: Typography.heading,
-//     fontSize: Typography.size.lg,
-//     color: Colors.textPrimary,
-//   },
-//   relatedCard: {
-//     flexDirection: 'row',
-//     alignItems: 'center',
-//     backgroundColor: Colors.surface,
-//     borderRadius: Radii.md,
-//     padding: 12,
-//     gap: 12,
-//     borderWidth: 1,
-//     borderColor: Colors.border,
-//     ...Shadows.sm,
-//   },
-//   relatedNum: {
-//     width: 36,
-//     height: 36,
-//     borderRadius: Radii.full,
-//     backgroundColor: Colors.primary + '15',
-//     alignItems: 'center',
-//     justifyContent: 'center',
-//   },
-//   relatedNumLocked: {
-//     backgroundColor: Colors.surfaceMuted,
-//   },
-//   relatedNumText: {
-//     fontFamily: Typography.bodyMedium,
-//     fontSize: Typography.size.sm,
-//     color: Colors.primary,
-//   },
-//   relatedInfo: { flex: 1, gap: 2 },
-//   relatedName: {
-//     fontFamily: Typography.body,
-//     fontSize: Typography.size.base,
-//     color: Colors.textPrimary,
-//   },
-//   relatedDuration: {
-//     fontFamily: Typography.body,
-//     fontSize: Typography.size.xs,
-//     color: Colors.textMuted,
-//   },
-// });
