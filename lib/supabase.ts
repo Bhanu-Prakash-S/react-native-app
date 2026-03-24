@@ -438,3 +438,54 @@ export async function getLessonWithContext(
     subject_id: subject?.id ?? "",
   };
 }
+
+// ─── Payment helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Insert a successful purchase record.
+ * NOTE: In production, payment signature MUST be verified on your backend
+ * before calling this — never trust client-side payment data alone.
+ */
+export async function insertPurchase(
+  userId: string,
+  razorpayPaymentId: string,
+  amountPaise: number = 99900,
+): Promise<void> {
+  const { error } = await supabase.from("purchases").insert({
+    user_id: userId,
+    razorpay_payment_id: razorpayPaymentId,
+    amount_paise: amountPaise,
+    status: "success",
+  });
+  if (error) console.error("insertPurchase error:", error.message);
+}
+
+/**
+ * Mark the user's profile as paid.
+ */
+export async function markUserPaid(userId: string): Promise<void> {
+  const { error } = await supabase
+    .from("profiles")
+    .update({ is_paid: true })
+    .eq("id", userId);
+  if (error) console.error("markUserPaid error:", error.message);
+}
+
+/**
+ * Fetch the most recent successful purchase for the receipt screen.
+ */
+export async function getPurchaseReceipt(
+  userId: string,
+): Promise<Purchase | null> {
+  const { data, error } = await supabase
+    .from("purchases")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("status", "success")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .single();
+
+  if (error) return null;
+  return data as Purchase;
+}
